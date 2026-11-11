@@ -15,26 +15,36 @@ import {
   getEmptyImageData,
   initTexture,
   resizeImageToCover,
+  resizeTexture,
 } from './utils';
 
 const log = getLogger(LoggerNames.WebGl);
 
 export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
   const gl = canvas.getContext('webgl2', {
-    antialias: true,
+    // Every pass is a full-screen quad, so multisampling only adds a resolve per frame.
+    antialias: false,
     premultipliedAlpha: true,
   }) as WebGL2RenderingContext;
 
   let blurRadius: number | null = null;
   let maskBlurRadius: number | null = 8;
   const downsampleFactor = 4;
+  // The segmentation mask is at most a few hundred pixels across, so feathering it at
+  // full frame size only multiplies the box-blur cost. The mask buffers are kept near
+  // this longest edge and the composite upsamples them with LINEAR filtering.
+  const maskBufferTargetEdge = 640;
+  const getMaskDownsampleFactor = (width: number, height: number) =>
+    Math.max(1, Math.round(Math.max(width, height) / maskBufferTargetEdge));
 
   if (!gl) {
     log.error('Failed to create WebGL context');
     return undefined;
   }
 
-  gl.enable(gl.BLEND);
+  // Blending is only enabled around the composite draw: the intermediate passes all
+  // write opaque output, so blending them just costs a framebuffer read.
+  gl.disable(gl.BLEND);
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
   // Create the composite program
@@ -80,8 +90,8 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
   bgBlurTextures.push(initTexture(gl, 3)); // For blur pass 1
   bgBlurTextures.push(initTexture(gl, 4)); // For blur pass 2
 
-  const bgBlurTextureWidth = Math.floor(canvas.width / downsampleFactor);
-  const bgBlurTextureHeight = Math.floor(canvas.height / downsampleFactor);
+  let bgBlurTextureWidth = Math.floor(canvas.width / downsampleFactor);
+  let bgBlurTextureHeight = Math.floor(canvas.height / downsampleFactor);
 
   const downSampler = createDownSampler(gl, bgBlurTextureWidth, bgBlurTextureHeight);
 
@@ -93,9 +103,18 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
     createFramebuffer(gl, bgBlurTextures[1], bgBlurTextureWidth, bgBlurTextureHeight),
   );
 
+  let maskDownsampleFactor = getMaskDownsampleFactor(canvas.width, canvas.height);
+  let maskBufferWidth = Math.max(1, Math.round(canvas.width / maskDownsampleFactor));
+  let maskBufferHeight = Math.max(1, Math.round(canvas.height / maskDownsampleFactor));
+
   // Initialize texture for the first mask blur pass
   const tempMaskTexture = initTexture(gl, 5);
-  const tempMaskFrameBuffer = createFramebuffer(gl, tempMaskTexture, canvas.width, canvas.height);
+  const tempMaskFrameBuffer = createFramebuffer(
+    gl,
+    tempMaskTexture,
+    maskBufferWidth,
+    maskBufferHeight,
+  );
 
   // Initialize two textures for double-buffering the final mask
   finalMaskTextures.push(initTexture(gl, 6)); // For reading in renderFrame
@@ -103,9 +122,42 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
 
   // Create framebuffers for the final mask textures
   const finalMaskFrameBuffers = [
-    createFramebuffer(gl, finalMaskTextures[0], canvas.width, canvas.height),
-    createFramebuffer(gl, finalMaskTextures[1], canvas.width, canvas.height),
+    createFramebuffer(gl, finalMaskTextures[0], maskBufferWidth, maskBufferHeight),
+    createFramebuffer(gl, finalMaskTextures[1], maskBufferWidth, maskBufferHeight),
   ];
+
+  // Store custom background image, cropped to cover the canvas, and the source it was cropped from
+  let customBackgroundImage: ImageBitmap | ImageData | null = null;
+  let backgroundSourceImage: ImageBitmap | null = null;
+
+  // The transformer sets the canvas to each frame's display size, which drifts from the size the buffers
+  // were allocated at (device rotation, iOS reporting the unrotated sensor size). Called from updateMask
+  // and renderFrame: whichever first sees a new size reallocates, the other only compares.
+  let bufferWidth = canvas.width;
+  let bufferHeight = canvas.height;
+
+  function ensureBuffersMatchCanvas() {
+    if (canvas.width === bufferWidth && canvas.height === bufferHeight) {
+      return;
+    }
+    bufferWidth = canvas.width;
+    bufferHeight = canvas.height;
+    bgBlurTextureWidth = Math.floor(bufferWidth / downsampleFactor);
+    bgBlurTextureHeight = Math.floor(bufferHeight / downsampleFactor);
+    for (const texture of [downSampler.texture, ...bgBlurTextures]) {
+      resizeTexture(gl, texture, bgBlurTextureWidth, bgBlurTextureHeight);
+    }
+    maskDownsampleFactor = getMaskDownsampleFactor(bufferWidth, bufferHeight);
+    maskBufferWidth = Math.max(1, Math.round(bufferWidth / maskDownsampleFactor));
+    maskBufferHeight = Math.max(1, Math.round(bufferHeight / maskDownsampleFactor));
+    for (const texture of [tempMaskTexture, ...finalMaskTextures]) {
+      resizeTexture(gl, texture, maskBufferWidth, maskBufferHeight);
+    }
+    if (backgroundSourceImage) {
+      // Not awaited: the image cropped for the previous size shows until the re-crop resolves.
+      setBackgroundImage(backgroundSourceImage);
+    }
+  }
 
   let backgroundImageDisabled = false;
 
@@ -116,9 +168,6 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
   gl.uniform1i(frameTextureLocation, 1);
   gl.uniform1i(maskTextureLocation, 2);
 
-  // Store custom background image
-  let customBackgroundImage: ImageBitmap | ImageData | null = null;
-
   function renderFrame(frame: VideoFrame) {
     if (frame.codedWidth === 0 || finalMaskTextures.length === 0) {
       return;
@@ -127,13 +176,15 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
     const width = frame.displayWidth;
     const height = frame.displayHeight;
 
+    ensureBuffersMatchCanvas();
+
     // Prepare frame texture
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, frameTexture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
 
-    // Apply blur if enabled (and no custom background is set)
-    let backgroundTexture = bgTexture;
+    // The blurred frame, else the custom background, else the frame itself, which the composite passes through
+    let backgroundTexture = frameTexture;
 
     if (blurRadius) {
       const downSampledFrameTexture = applyDownsampling(
@@ -157,9 +208,8 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
         bgBlurTextures,
       );
     } else if (customBackgroundImage) {
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, bgTexture);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, customBackgroundImage);
+      // setBackgroundImage() uploads the image into bgTexture whenever it changes, and
+      // nothing else writes to it, so the static background is not re-uploaded per frame.
       backgroundTexture = bgTexture;
     }
 
@@ -188,7 +238,9 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, finalMaskTextures[readMaskIndex]);
     gl.uniform1i(maskTextureLocation, 2);
+    gl.enable(gl.BLEND);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.disable(gl.BLEND);
   }
 
   /**
@@ -196,24 +248,28 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
    * @param image The background image to use, or null to clear
    */
   async function setBackgroundImage(image: ImageBitmap | null) {
-    // Clear existing background
-    customBackgroundImage = null;
+    backgroundSourceImage = image;
 
-    if (image) {
-      customBackgroundImage = getEmptyImageData();
+    if (!image) {
+      customBackgroundImage = null;
+    } else {
+      // bgTexture keeps showing the current image until the new one is cropped
+      let croppedImage: ImageBitmap | ImageData = getEmptyImageData();
       try {
         // Resize and crop the image to cover the canvas
-        const croppedImage = await resizeImageToCover(image, canvas.width, canvas.height);
-
-        // Store the cropped and resized image
-        customBackgroundImage = croppedImage;
+        croppedImage = await resizeImageToCover(image, canvas.width, canvas.height);
       } catch (error) {
         log.error(
           'Error processing background image, falling back to black background:',
           error,
         );
       }
+      // A later call or cleanup() replaced or cleared the image while it was cropping
+      if (image !== backgroundSourceImage) {
+        return;
+      }
 
+      customBackgroundImage = croppedImage;
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, bgTexture);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, customBackgroundImage);
@@ -222,7 +278,6 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
 
   function setBlurRadius(radius: number | null) {
     blurRadius = radius ? Math.max(1, Math.floor(radius / downsampleFactor)) : null; // we are downsampling the blur texture, so decrease the radius here for better performance with a similar visual result
-    setBackgroundImage(null);
   }
 
   function setBackgroundDisabled(disabled: boolean) {
@@ -230,6 +285,12 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
   }
 
   function updateMask(mask: WebGLTexture) {
+    // Same guard as renderFrame: cleanup() empties the arrays, a late segmentation callback must not touch them.
+    if (finalMaskTextures.length === 0) {
+      return;
+    }
+    ensureBuffersMatchCanvas();
+
     // Use the existing applyBlur function to apply the first blur pass
     // The second blur pass will be written to finalMaskTextures[writeMaskIndex]
 
@@ -242,9 +303,10 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
     applyBlur(
       gl,
       mask,
-      canvas.width,
-      canvas.height,
-      maskBlurRadius || 1.0,
+      maskBufferWidth,
+      maskBufferHeight,
+      // The radius is in mask-buffer texels, so scale it down with the buffer.
+      Math.max(1, Math.round((maskBlurRadius || 1.0) / maskDownsampleFactor)),
       boxBlurProgram,
       boxBlurUniforms,
       vertexBuffer!,
@@ -297,10 +359,32 @@ export const setupWebGL = (canvas: OffscreenCanvas | HTMLCanvasElement) => {
       }
       customBackgroundImage = null;
     }
+    backgroundSourceImage = null;
     bgBlurTextures = [];
     bgBlurFrameBuffers = [];
     finalMaskTextures = [];
   }
 
-  return { renderFrame, updateMask, setBackgroundImage, setBlurRadius, setBackgroundDisabled, cleanup };
+  /**
+   * Release the WebGL context instead of leaving it alive until the canvas is garbage
+   * collected; browsers cap live contexts and drop the oldest past that.
+   *
+   * Kept apart from cleanup() because a lost context stays bound to its canvas: getContext()
+   * on the same canvas returns it again, so this is only for a canvas that will not be reused.
+   * Anything else rendering into the context (the MediaPipe segmenter shares it) must be
+   * closed first. Without WEBGL_lose_context the context is left to GC.
+   */
+  function releaseContext() {
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+  }
+
+  return {
+    renderFrame,
+    updateMask,
+    setBackgroundImage,
+    setBlurRadius,
+    setBackgroundDisabled,
+    cleanup,
+    releaseContext,
+  };
 };

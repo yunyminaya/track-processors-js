@@ -24,6 +24,14 @@ export type BackgroundOptions = {
   onFrameProcessed?: (stats: FrameProcessingStats) => void;
 };
 
+/**
+ * `cause` is assigned rather than passed to the constructor, because browsers without support for
+ * the `cause` option ignore it.
+ */
+function errorWithCause(message: string, cause: unknown) {
+  return Object.assign(new Error(message), { cause });
+}
+
 export default class BackgroundProcessor extends VideoTransformer<BackgroundOptions> {
   static get isSupported() {
     return (
@@ -51,7 +59,9 @@ export default class BackgroundProcessor extends VideoTransformer<BackgroundOpti
   constructor(opts: BackgroundOptions) {
     super();
     this.options = opts;
-    this.update(opts);
+    this.update(opts).catch((err) =>
+      this.log.error('Error while applying initial processor options: ', err),
+    );
   }
 
   async init({ outputCanvas, inputElement: inputVideo }: VideoTransformerInitOptions) {
@@ -76,6 +86,14 @@ export default class BackgroundProcessor extends VideoTransformer<BackgroundOpti
       runningMode: 'VIDEO',
       outputCategoryMask: true,
       outputConfidenceMasks: false,
+    }).catch((err) => {
+      // MediaPipe loads its wasm loader through a <script> tag and rejects with that tag's error
+      // Event, which has no message. The script's URL is the only thing identifying the failure.
+      if (err instanceof Event) {
+        const src = err.target instanceof HTMLScriptElement ? err.target.src : 'unknown URL';
+        throw errorWithCause(`Failed to load the MediaPipe tasks-vision fileset from ${src}`, err);
+      }
+      throw err;
     });
 
     // Skip loading the image here if update already loaded the image below
@@ -91,8 +109,13 @@ export default class BackgroundProcessor extends VideoTransformer<BackgroundOpti
   }
 
   async destroy(options?: TrackTransformerDestroyOptions) {
+    // The segmenter renders into the canvas's WebGL context, which super.destroy() releases,
+    // so it is closed first. Disabling first passes frames that arrive during the close through.
+    this.isDisabled = true;
+    const segmenter = this.imageSegmenter;
+    this.imageSegmenter = undefined;
+    await segmenter?.close();
     await super.destroy();
-    await this.imageSegmenter?.close();
     this.backgroundImageAndPath = null;
 
     if (!options?.willProcessorRestart) {
@@ -107,13 +130,18 @@ export default class BackgroundProcessor extends VideoTransformer<BackgroundOpti
       await new Promise((resolve, reject) => {
         img.crossOrigin = 'Anonymous';
         img.onload = () => resolve(img);
-        img.onerror = (err) => reject(err);
+        img.onerror = (event) =>
+          reject(errorWithCause(`Failed to load background image from ${path}`, event));
         img.src = path;
       });
       const imageData = await createImageBitmap(img);
       this.backgroundImageAndPath = { imageData, path };
     }
-    this.gl?.setBackgroundImage(this.backgroundImageAndPath.imageData);
+    // A later update() switched to another background while the image was loading
+    if (this.options.imagePath !== path) {
+      return;
+    }
+    await this.gl?.setBackgroundImage(this.backgroundImageAndPath.imageData);
   }
 
   async transform(frame: VideoFrame, controller: TransformStreamDefaultController<VideoFrame>) {
@@ -124,7 +152,7 @@ export default class BackgroundProcessor extends VideoTransformer<BackgroundOpti
         return;
       }
 
-      let skipProcessingFrame = this.isDisabled ?? this.options.backgroundDisabled ?? false;
+      let skipProcessingFrame = this.isDisabled || (this.options.backgroundDisabled ?? false);
       if (typeof this.options.blurRadius !== 'number' && typeof this.options.imagePath !== 'string') {
         skipProcessingFrame = true;
       }
@@ -162,6 +190,9 @@ export default class BackgroundProcessor extends VideoTransformer<BackgroundOpti
             });
           });
         }
+      }
+      if (this.isDisabled || !this.imageSegmenter) {
+        return;
       }
       this.isFirstFrame = false;
 
@@ -214,12 +245,16 @@ export default class BackgroundProcessor extends VideoTransformer<BackgroundOpti
   async update(opts: BackgroundOptions) {
     this.options = { ...this.options, ...opts };
 
-    this.gl?.setBlurRadius(opts.blurRadius ?? null);
+    // The blur or the previous image stays on screen until the new image is ready
     if (opts.imagePath) {
       await this.loadAndSetBackground(opts.imagePath);
+      if (this.options.imagePath !== opts.imagePath) {
+        return;
+      }
     } else {
       this.gl?.setBackgroundImage(null);
     }
+    this.gl?.setBlurRadius(opts.blurRadius ?? null);
     this.gl?.setBackgroundDisabled(opts.backgroundDisabled ?? false);
   }
 

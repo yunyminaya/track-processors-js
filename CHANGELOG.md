@@ -1,5 +1,31 @@
 # @livekit/track-processors
 
+## 0.8.2
+
+### Patch Changes
+
+- Reduce GPU work per frame in the background processor: merge Gaussian blur taps for bilinear fetches, feather the segmentation mask at reduced resolution, enable blending only for the composite pass, disable multisampling, and stop re-uploading a static background image every frame - [#131](https://github.com/livekit/track-processors-js/pull/131) ([@changt](https://github.com/changt))
+
+## 0.8.1
+
+### Patch Changes
+
+- Fix the processed track freezing for remote participants when the sender minimises or occludes the window in browsers without Insertable Streams (Firefox, Safari): the fallback pipeline's render loop is now driven by a worker timer, which keeps ticking while the document is hidden, instead of requestAnimationFrame, which does not. - [#127](https://github.com/livekit/track-processors-js/pull/127) ([@CSantosM](https://github.com/CSantosM))
+
+  Also fix the fallback pipeline running below its configured `maxFps`: the frame gate compared the elapsed time against a fixed interval, which quantised the output rate against any periodic clock (`maxFps: 30` measured 20.8 to 23.0 fps), and is now a drift-free deadline.
+
+  Also validate `maxFps` when the processor is constructed: a value that is not a positive finite number (for example `0`) now throws a `RangeError` instead of leaving the fallback pipeline idle.
+
+## 0.8.0
+
+### Minor Changes
+
+- Add GainAudioProcessor — a reference audio TrackProcessor implementation using the Web Audio API. Includes gain control, browser support detection via `isSupported`, and a complete example in the sample app. Also restructures documentation into separate video and audio processor guides. - [#124](https://github.com/livekit/track-processors-js/pull/124) ([@yepher](https://github.com/yepher))
+
+### Patch Changes
+
+- Fix the background mask coming out clipped and offset when the frame size differs from the track settings (device rotation, iPhone portrait), size the canvas fallback output to the source video's size, and keep the fallback render loop alive when `play()` is rejected. - [#128](https://github.com/livekit/track-processors-js/pull/128) ([@welson-ribbon](https://github.com/welson-ribbon))
+
 ## 0.7.2
 
 ### Patch Changes
